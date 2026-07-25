@@ -1,199 +1,166 @@
-import { createCanvas, loadImage, GlobalFonts } from '@napi-rs/canvas'
-import { writeFile, mkdir } from 'node:fs/promises'
-import { existsSync } from 'node:fs'
-import { join, dirname } from 'node:path'
-import { fileURLToPath } from 'node:url'
+// src/scrape/kompas.js
 import axios from 'axios'
+import * as cheerio from 'cheerio'
 
-const __dirname = dirname(fileURLToPath(import.meta.url))
+const UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
 
-const NEWS_BG_URL = 'https://raw.githubusercontent.com/ryyntwx/allimagerin/refs/heads/main/Fberita.png'
-const FONT_URL = 'https://fonts.gstatic.com/s/inter/v18/UcCO3FwrK3iLTeHuS_nVMrMxCp50SjIw2boKoduKmMEVuFuYAZ9hiJ-Ek-_EeA.woff2'
-const PHOTO_SOURCE = 'https://raw.githubusercontent.com/Ditzzx-vibecoder/Assets/main/Image/jpg'
-
-const ASSETS_DIR = join(__dirname, 'assets', 'newsrin')
-const FONTS_DIR = join(ASSETS_DIR, 'fonts')
-const BG_LOCAL = join(ASSETS_DIR, 'berita.png')
-const FONT_LOCAL = join(FONTS_DIR, 'Inter-Bold.ttf')
-const PHOTO_CACHE = join(ASSETS_DIR, 'photo_cache.jpg')
-
-const BG_W = 962
-const BG_H = 1634
-
-const config = {
-  text: {
-    x: 30,
-    y: 277,
-    maxWidth: 1010,
-  },
-  foto: {
-    a: 1025,
-    b: 1634,
-    c: 0,
-    d: 962,
-    radius: 0,
-  },
-}
-
-async function download(url) {
-  const res = await axios.get(url, {
-    responseType: 'arraybuffer',
-    headers: { 'User-Agent': 'Mozilla/5.0' },
-    maxRedirects: 5,
-  })
-  return Buffer.from(res.data)
-}
-
-async function ensureAssets() {
-  await mkdir(FONTS_DIR, { recursive: true })
-
-  if (!existsSync(BG_LOCAL)) {
-    console.log('⬇ Mengunduh background berita...')
-    await writeFile(BG_LOCAL, await download(NEWS_BG_URL))
+async function fetchRSS(limit = 10) {
+  try {
+    const res = await axios.get('https://rss.kompas.com/kompas', {
+      headers: { 'User-Agent': UA },
+      timeout: 10000,
+    })
+    const $ = cheerio.load(res.data, { xmlMode: true })
+    const articles = []
+    $('item').each((i, item) => {
+      if (articles.length >= limit) return
+      const title = $(item).find('title').text().trim()
+      const link = $(item).find('link').text().trim()
+      const description = $(item).find('description').text().trim()
+      const pubDate = $(item).find('pubDate').text().trim()
+      if (title && link) {
+        articles.push({
+          title,
+          url: link,
+          thumbnail: null,
+          description: description || title,
+          time: pubDate,
+          author: 'Kompas.com',
+          source: 'Kompas.com (RSS)',
+        })
+      }
+    })
+    return articles
+  } catch (e) {
+    console.error('[KOMPAS] RSS error:', e.message)
+    return []
   }
-
-  if (!existsSync(FONT_LOCAL)) {
-    console.log('⬇ Mengunduh font berita...')
-    await writeFile(FONT_LOCAL, await download(FONT_URL))
-  }
-
-  GlobalFonts.registerFromPath(FONT_LOCAL, 'InterNews')
 }
 
-async function resolvePhoto(src) {
-  if (!src || src === PHOTO_SOURCE) {
-    // Jika tidak ada foto, download default
-    if (!existsSync(PHOTO_CACHE)) {
-      await writeFile(PHOTO_CACHE, await download(PHOTO_SOURCE))
+async function scrapeHTML(query = null, limit = 5) {
+  try {
+    let url = 'https://www.kompas.com/'
+    if (query) {
+      url = `https://www.kompas.com/search?q=${encodeURIComponent(query)}`
     }
-    return PHOTO_CACHE
-  }
 
-  if (/^https?:\/\//i.test(src)) {
-    await writeFile(PHOTO_CACHE, await download(src))
-    return PHOTO_CACHE
-  }
+    const res = await axios.get(url, {
+      headers: {
+        'User-Agent': UA,
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
+      },
+      timeout: 15000,
+    })
 
-  if (existsSync(src)) return src
-  throw new Error(`File lokal tidak ditemukan: ${src}`)
+    const $ = cheerio.load(res.data)
+    const articles = []
+
+    // Collect all links that look like article links
+    const linkElements = $('a[href*="/read/"], a[href*="/story/"]')
+    const seen = new Set()
+
+    for (const el of linkElements) {
+      if (articles.length >= limit) break
+      const link = $(el).attr('href')
+      if (!link || seen.has(link)) continue
+      const title = $(el).text().trim()
+      if (!title || title.length < 10) continue
+      seen.add(link)
+
+      // Try to get thumbnail from parent or img
+      let thumbnail = null
+      const parent = $(el).closest(
+        '.article__item, .article__asset, .articleList__item, .most__item, .headline__item, .latest__item, .post-item'
+      )
+      const img = parent.find('img').first()
+      if (img.length) {
+        thumbnail = img.attr('src') || img.attr('data-src') || null
+        if (thumbnail && thumbnail.startsWith('//')) thumbnail = 'https:' + thumbnail
+      }
+
+      // Description
+      let description = ''
+      const desc = parent.find('.article__summary, .article__description, .articleList__summary, .headline__description')
+      if (desc.length) description = desc.text().trim()
+
+      let time = ''
+      const timeEl = parent.find('.article__time, .article__date, .timeago, .post__time')
+      if (timeEl.length) time = timeEl.text().trim()
+
+      let author = ''
+      const authorEl = parent.find('.article__author, .post__author, .writer')
+      if (authorEl.length) author = authorEl.text().trim()
+
+      const fullUrl = link.startsWith('http') ? link : `https://www.kompas.com${link}`
+
+      articles.push({
+        title,
+        url: fullUrl,
+        thumbnail,
+        description: description || title,
+        time,
+        author,
+        source: 'Kompas.com',
+      })
+    }
+
+    return articles
+  } catch (e) {
+    console.error('[KOMPAS] HTML error:', e.message)
+    return []
+  }
 }
 
-function wordWrap(text, ctx, maxWidth) {
-  const words = text.split(' ')
-  const lines = []
-  let current = ''
-  for (let i = 0; i < words.length; i++) {
-    const test = current + words[i] + ' '
-    if (ctx.measureText(test.trim()).width > maxWidth && i > 0) {
-      lines.push(current.trim())
-      current = words[i] + ' '
-    } else {
-      current = test
+export async function scrapeKompas(query = null, limit = 5) {
+ 
+  if (!query) {
+    const rss = await fetchRSS(limit)
+    if (rss.length) {
+      return {
+        success: true,
+        articles: rss,
+        total: rss.length,
+        query: 'terkini',
+      }
     }
   }
-  if (current) lines.push(current.trim())
-  return lines
-}
 
-function roundedClipPath(ctx, x, y, w, h, r) {
-  ctx.beginPath()
-  ctx.moveTo(x + r, y)
-  ctx.lineTo(x + w - r, y)
-  ctx.quadraticCurveTo(x + w, y, x + w, y + r)
-  ctx.lineTo(x + w, y + h - r)
-  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h)
-  ctx.lineTo(x + r, y + h)
-  ctx.quadraticCurveTo(x, y + h, x, y + h - r)
-  ctx.lineTo(x, y + r)
-  ctx.quadraticCurveTo(x, y, x + r, y)
-  ctx.closePath()
-}
+ 
+  let articles = await scrapeHTML(query, limit)
 
-async function drawFoto(ctx, imagePath, zone) {
-  const { a, b, c, d, radius } = zone
-  const x = c
-  const y = a
-  const w = d - c
-  const h = b - a
-  const r = radius ?? 0
-
-  const img = await loadImage(imagePath)
-  const imgRatio = img.width / img.height
-  const boxRatio = w / h
-
-  ctx.save()
-  roundedClipPath(ctx, x, y, w, h, r)
-  ctx.clip()
-
-  ctx.filter = 'blur(28px)'
-  ctx.drawImage(img, x - 40, y - 40, w + 80, h + 80)
-  ctx.filter = 'none'
-
-  let fw, fh
-  if (imgRatio > boxRatio) {
-    fw = w
-    fh = fw / imgRatio
-  } else {
-    fh = h
-    fw = fh * imgRatio
+  if (query && articles.length === 0) {
+    const rssAll = await fetchRSS(20)
+    const filtered = rssAll.filter((a) =>
+      a.title.toLowerCase().includes(query.toLowerCase())
+    )
+    if (filtered.length) {
+      articles = filtered.slice(0, limit)
+    }
   }
 
-  ctx.drawImage(img, x + (w - fw) / 2, y + (h - fh) / 2, fw, fh)
-  ctx.restore()
-}
-
-export async function generateNews(newsText, photoSrc, outputPath) {
-  await ensureAssets()
-
-  const text = newsText.replace(/\s+/g, ' ').trim()
-  const { x, y, maxWidth } = config.text
-
-  const photoPath = await resolvePhoto(photoSrc)
-
-  const canvas = createCanvas(BG_W, BG_H)
-  const ctx = canvas.getContext('2d')
-  const bgImg = await loadImage(BG_LOCAL)
-  ctx.drawImage(bgImg, 0, 0, BG_W, BG_H)
-
-  await drawFoto(ctx, photoPath, config.foto)
-
-  const words = text.split(' ')
-  const fontSize = words.length <= 18 ? 76 : 56
-  const lineGap = words.length <= 18 ? 12 : 18
-  const lineHeight = fontSize + lineGap
-
-  ctx.font = `700 ${fontSize}px InterNews`
-  ctx.fillStyle = '#eaf2f8'
-  ctx.textAlign = 'left'
-  ctx.textBaseline = 'top'
-
-  let lines = wordWrap(text, ctx, maxWidth)
-  if (lines.length > 6) {
-    lines = lines.slice(0, 5)
-    lines.push('...')
+  if (articles.length === 0) {
+    return {
+      success: false,
+      articles: [],
+      total: 0,
+      error: 'Tidak ada berita ditemukan.',
+    }
   }
 
-  ctx.save()
-  for (let i = 0; i < lines.length; i++) {
-    ctx.fillText(lines[i], x, y + i * lineHeight)
+  return {
+    success: true,
+    articles: articles.slice(0, limit),
+    total: articles.length,
+    query: query || 'terkini',
   }
-  ctx.restore()
-
-  const pngData = await canvas.encode('png')
-  const TMP_DIR = join(process.cwd(), 'storage', '.tmp')
-  await mkdir(TMP_DIR, { recursive: true })
-  const out = outputPath ?? join(TMP_DIR, `news-${Date.now()}.png`)
-  await writeFile(out, pngData)
-  console.log('Saved:', out)
-  return out
 }
 
-// Jalankan langsung hanya jika file ini dijalankan sebagai skrip utama
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  const newsText = process.argv[2] || 'Halo my bini i am gwh'
-  const photoSrc = process.argv[3] || PHOTO_SOURCE
-  generateNews(newsText, photoSrc).catch(err => {
-    console.error('❌ Error:', err.message || err)
-    process.exit(1)
-  })
+export async function getKompasTrending(limit = 5) {
+  return scrapeKompas(null, limit)
+}
+
+export async function searchKompas(query, limit = 5) {
+  return scrapeKompas(query, limit)
 }

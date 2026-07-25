@@ -1,91 +1,168 @@
-// plugins/search/wikipedia.js
-import { searchWikipedia, getFullArticle } from '../../src/scrape/wikipedia.js'
-import { AIRich } from '../../src/lib/_build-m.js'
+// src/scrape/wikipedia.js
+import axios from 'axios'
+import * as cheerio from 'cheerio'
 
-export const config_ = {
-  name: 'wikipedia',
-  alias: ['wiki', 'wikisearch', 'caridefinisi'],
-  category: 'search',
-  description: 'Cari artikel di Wikipedia',
-  usage: '.wiki <kata kunci>',
-  example: '.wiki Indonesia',
-  isOwner: false,
-  isPremium: false,
-  isGroup: false,
-  isPrivate: false,
-  cooldown: 10,
-  isEnabled: true,
+const UA = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Mobile Safari/537.36'
+
+function decodeHtml(text) {
+  return String(text || '')
+    .replace(/&quot;/g, '"')
+    .replace(/&#039;/g, "'")
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
 }
-export { config_ as config }
 
-export async function handler(m, { sock }) {
-  const input = m.text?.trim()
-  if (!input) {
-    return m.reply('❌ Masukkan kata kunci.\nContoh: *.wiki Albert Einstein*')
+function cleanText(text) {
+  return decodeHtml(text)
+    .replace(/<\/?[^>]+>/g, '')
+    .replace(/\[\d+\]/g, '')
+    .replace(/\[[a-z]\]/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function cleanBlock(text) {
+  return decodeHtml(text)
+    .replace(/<\/?[^>]+>/g, '')
+    .replace(/\[\d+\]/g, '')
+    .replace(/\[[a-z]\]/gi, '')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
+function fixUrl(url, base) {
+  if (!url) return null
+  if (url.startsWith('//')) return `https:${url}`
+  if (url.startsWith('/')) return `${base}${url}`
+  return url
+}
+
+function uniqueBy(array, key) {
+  return array.filter((item, index, self) => self.findIndex(x => x[key] === item[key]) === index)
+}
+
+export async function searchWikipedia(query, lang = 'id', limit = 5) {
+  const BASE = `https://${lang}.wikipedia.org`
+  const API = `${BASE}/w/api.php`
+
+  const { data, status } = await axios.get(API, {
+    params: {
+      action: 'query',
+      list: 'search',
+      srsearch: query,
+      srlimit: limit,
+      format: 'json',
+      origin: '*',
+    },
+    headers: {
+      'user-agent': UA,
+      'accept-language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
+    },
+  })
+
+  return {
+    code: status,
+    results: data?.query?.search || [],
+    baseUrl: BASE,
+  }
+}
+
+export async function getFullArticle(title, lang = 'id') {
+  const BASE = `https://${lang}.wikipedia.org`
+  const pagePath = `/wiki/${encodeURIComponent(title.replaceAll(' ', '_'))}`
+  const pageUrl = `${BASE}${pagePath}`
+
+  const { data, status } = await axios.get(pageUrl, {
+    headers: {
+      'user-agent': UA,
+      accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+      'accept-language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
+      referer: 'https://www.wikipedia.org/',
+    },
+  })
+
+  const $ = cheerio.load(data)
+
+  // Remove unnecessary elements
+  $('script, style, noscript, sup.reference, .mw-editsection, .navbox, .metadata, .ambox, .hatnote, .toc, #toc, table.vertical-navbox').remove()
+
+  const pageTitle = cleanText($('#firstHeading').text()) || title
+  const description = cleanText($('.tagline').first().text()) || null
+
+  // Extract intro paragraphs
+  const introParagraphs = []
+  $('.mw-parser-output > section').first().find('p').each((_, el) => {
+    const text = cleanBlock($(el).text())
+    if (text.length > 40) introParagraphs.push(text)
+  })
+
+  if (!introParagraphs.length) {
+    $('.mw-parser-output > p').each((_, el) => {
+      const text = cleanBlock($(el).text())
+      if (text.length > 40) introParagraphs.push(text)
+    })
   }
 
-  await m.react('🔍')
+  // Extract sections
+  const sections = []
+  $('.mw-parser-output > section').each((_, section) => {
+    const heading = cleanText($(section).find('h2, h3').first().text())
+    if (!heading || heading.toLowerCase() === 'daftar isi') return
 
-  try {
-    const search = await searchWikipedia(input)
+    const texts = []
+    $(section).find('p, ul, ol').each((_, el) => {
+      const text = cleanBlock($(el).text())
+      if (text.length > 40) texts.push(text)
+    })
 
-    if (!search.results.length) {
-      await m.react('😔')
-      return m.reply(`❌ Artikel *${input}* tidak ditemukan di Wikipedia.`)
-    }
-
-    const first = search.results[0]
-    const detail = await getFullArticle(first.title)
-
-    const article = detail.article
-    const builder = new AIRich(sock).setTitle(`📚 ${article.title}`)
-
-    if (article.images.length > 0) {
-      builder.addImage(article.images[0].url, { resolveUrl: false })
-    }
-
-    if (article.extract) {
-      
-      const maxChars = 800
-      const extractText = article.extract.length > maxChars
-        ? article.extract.slice(0, maxChars) + '…'
-        : article.extract
-      builder.addText(extractText)
-    }
-
-
-    if (Object.keys(article.infobox).length > 0) {
-      const rows = [['Info', 'Detail']]
-      for (const [key, value] of Object.entries(article.infobox).slice(0, 8)) {
-        rows.push([key, value])
-      }
-      builder.addTable(rows)
-    }
-
-
-    if (article.sections.length > 0) {
-      const sectionList = article.sections.map((s, i) => `${i + 1}. ${s.title}`).join('\n')
-      builder.addText(`📑 *Daftar Isi:*\n${sectionList}`)
-    }
-
-    
-    builder.setFooter(`Wikipedia • ${article.url}`)
-
-    
-    const suggestList = ['wikipedia']
-    if (article.sections.length > 0) {
-     
-      article.sections.slice(0, 4).forEach(s => {
-        suggestList.push(`wiki ${s.title}`)
+    if (texts.length) {
+      sections.push({
+        title: heading,
+        text: texts.join('\n\n'),
       })
     }
-    builder.addSuggest(suggestList.slice(0, 6))
+  })
 
-    await builder.send(m.chat, { quoted: m.raw })
-    await m.react('✅')
-  } catch (err) {
-    await m.react('❌')
-    console.error('[WIKIPEDIA]', err)
-    await m.reply(`❌ Gagal mengambil data: ${err.message}`)
+  // Extract infobox
+  const infobox = {}
+  $('.infobox tr').each((_, tr) => {
+    const key = cleanText($(tr).find('th').first().text())
+    const value = cleanText($(tr).find('td').first().text())
+    if (key && value && key.length < 100) {
+      infobox[key] = value
+    }
+  })
+
+  // Extract images
+  const images = []
+  $('.mw-parser-output img').each((_, img) => {
+    const src = fixUrl($(img).attr('src'), BASE)
+    const alt = cleanText($(img).attr('alt'))
+    if (!src) return
+    if (src.includes('static/images')) return
+    if (src.includes('Semi-protection')) return
+    if (src.includes('OOjs_UI')) return
+
+    images.push({
+      alt: alt || null,
+      url: src,
+    })
+  })
+
+  return {
+    code: status,
+    article: {
+      title: pageTitle,
+      description,
+      url: pageUrl,
+      extract: introParagraphs.join('\n\n') || null,
+      sections,
+      infobox,
+      images: uniqueBy(images, 'url'),
+    },
   }
 }

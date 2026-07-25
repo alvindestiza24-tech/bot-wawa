@@ -1,106 +1,100 @@
-import axios from 'axios'
-import { beautifulMessage } from '../../src/lib/text-formater.js'
-import { AIRich } from '../../src/lib/_build-m.js'
+// src/scrape/instalk.js
+import axios from 'axios';
+import { wrapper } from 'axios-cookiejar-support';
+import { CookieJar } from 'tough-cookie';
 
-export const config_ = {
-  name: 'igstalk',
-  alias: ['instagramstalk', 'ig', 'stalking'],
-  category: 'stalk',
-  description: 'Stalk profil Instagram dengan tampilan AI Rich Post + Tabel',
-  usage: '.igstalk <username>',
-  example: '.igstalk kersenify666',
-  isOwner: false,
-  isPremium: false,
-  isGroup: false,
-  isPrivate: false,
-  cooldown: 10,
-  isEnabled: true,
-}
-export { config_ as config }
+const jar = new CookieJar();
+const client = wrapper(axios.create({ jar, withCredentials: true }));
 
-function formatNumber(n) {
-  if (!n) return '0'
-  if (n >= 1e9) return (n / 1e9).toFixed(1) + 'M'
-  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'jt'
-  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'rb'
-  return String(n)
-}
+const baseHeaders = {
+    'host': 'insta-stories-viewer.com',
+    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0',
+    'accept': '*/*',
+    'accept-language': 'en-US,en;q=0.9',
+    'origin': 'https://insta-stories-viewer.com',
+    'sec-fetch-dest': 'empty',
+    'sec-fetch-mode': 'cors',
+    'sec-fetch-site': 'same-origin',
+};
 
-export async function handler(m, { sock }) {
-  const username = (m.args[0] || m.text || '').replace('@', '').trim()
-  if (!username) {
-    return m.reply(beautifulMessage('❌ Masukkan username Instagram. Contoh: .igstalk kersenify666', { pushName: m.pushName }))
-  }
+export async function instalk(username) {
+    const referer = `https://insta-stories-viewer.com/${username}/`;
+    const headers = { ...baseHeaders, referer };
+    const t = () => `O${Date.now()}${Math.random().toString(36).substring(2, 7)}`;
 
-  await m.react('⏳')
+    try {
+        const resHtml = await client.get(`https://insta-stories-viewer.com/${username}/`, {
+            headers: {
+                ...baseHeaders,
+                'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'sec-fetch-dest': 'document',
+                'sec-fetch-mode': 'navigate',
+                'upgrade-insecure-requests': '1'
+            }
+        });
+        const html = resHtml.data;
 
-  try {
-    const { data } = await axios.get(
-      'https://api-nanzz.my.id/docs/api/stalker/ig-stalk.php',
-      { params: { username }, timeout: 30000 }
-    )
+        const getMeta = (regexStr) => {
+            const match = html.match(new RegExp(regexStr));
+            return match ? match[1].trim() : null;
+        };
 
-    if (!data?.status || !data?.result) {
-      return m.reply(beautifulMessage(`❌ Akun *@${username}* tidak ditemukan`, { pushName: m.pushName }))
+        const metadata = {
+            posts: getMeta('profile__stats-posts">([^<]+)<'),
+            followers: getMeta('profile__stats-followers">([^<]+)<'),
+            following: getMeta('profile__stats-follows">([^<]+)<'),
+            avatar: getMeta('<img class="profile__avatar-pic" src="([^"]+)"')
+        };
+
+        const resConnect = await client.get('https://insta-stories-viewer.com/connect/', { headers });
+        const token = resConnect.data.token;
+
+        const resPoll1 = await client.get(`https://insta-stories-viewer.com/socket.io/?EIO=4&transport=polling&t=${t()}`, { headers });
+        const sidMatch = resPoll1.data.match(/"sid":"([^"]+)"/);
+        if (!sidMatch) {
+            return { status: "error", code: 500, username, result: { message: "Gagal mendapatkan session ID" } };
+        }
+        const sid = sidMatch[1];
+
+        await client.post(`https://insta-stories-viewer.com/socket.io/?EIO=4&transport=polling&t=${t()}&sid=${sid}`, '40', {
+            headers: { ...headers, 'content-type': 'text/plain;charset=UTF-8' }
+        });
+
+        await client.get(`https://insta-stories-viewer.com/socket.io/?EIO=4&transport=polling&t=${t()}&sid=${sid}`, { headers });
+        await client.get(`https://insta-stories-viewer.com/socket.io/?EIO=4&transport=polling&t=${t()}&sid=${sid}`, { headers });
+
+        const date = Date.now();
+        const payload = `42["search",{"username":"${username}","date":${date},"token":"${token}"}]`;
+        await client.post(`https://insta-stories-viewer.com/socket.io/?EIO=4&transport=polling&t=${t()}&sid=${sid}`, payload, {
+            headers: { ...headers, 'content-type': 'text/plain;charset=UTF-8' }
+        });
+
+        const resPollFinal = await client.get(`https://insta-stories-viewer.com/socket.io/?EIO=4&transport=polling&t=${t()}&sid=${sid}`, { headers });
+        const rawData = resPollFinal.data;
+
+        let storiesData = [];
+        if (typeof rawData === 'string' && rawData.startsWith('42')) {
+            const parsed = JSON.parse(rawData.substring(2));
+            if (Array.isArray(parsed) && parsed.length > 1) {
+                storiesData = parsed[1];
+            }
+        }
+
+        return {
+            status: "success",
+            code: 200,
+            username: username,
+            result: {
+                metadata: metadata,
+                stories: storiesData
+            }
+        };
+    } catch (err) {
+        return {
+            status: "error",
+            code: err.response ? err.response.status : 500,
+            username: username,
+            result: { message: err.message }
+        };
     }
-
-    const r = data.result
-    const s = r.stats
-
-    // Bangun teks profil
-    const profileText = `## 👤 ${r.full_name || r.username}\n` +
-      `**Username:** [@${r.username}](https://instagram.com/${r.username})\n` +
-      `**Verified:** ${r.is_verified ? '✅' : '❌'}\n` +
-      `**Private:** ${r.is_private ? '🔒 Ya' : '🌍 Tidak'}\n` +
-      (r.bio ? `**Bio:** ${r.bio}\n` : '') +
-      (r.external_url ? `**Website:** ${r.external_url}\n` : '')
-
-    // Tabel statistik
-    const statsTable = [
-      ['Metric', 'Value'],
-      ['Followers', formatNumber(s.followers)],
-      ['Following', formatNumber(s.following)],
-      ['Posts', formatNumber(s.posts)],
-      ['Account Type', r.is_business ? 'Business' : 'Personal'],
-    ]
-
-    // Kirim sebagai AI Rich dengan Post + Tabel
-    const builder = new AIRich(sock)
-      .setTitle('📸 Instagram Profile')
-      .addText(profileText)
-      builder.addPost([
-      {
-        profile_url: r.profile_pic,
-        username: r.username,
-        title: r.full_name || r.username,
-        subtitle: r.is_verified ? 'Verified Account' : 'Instagram',
-        caption: r.bio || '-',
-        verified: r.is_verified || false,
-        url: `https://instagram.com/${r.username}`,
-        thumbnail: r.profile_pic,
-        source: 'INSTAGRAM',
-        footer: `${formatNumber(s.followers)} followers · ${formatNumber(s.following)} following`,
-        deeplink: `https://instagram.com/${r.username}`,
-        icon: r.profile_pic,
-        orientation: 'LANDSCAPE',
-        post_type: 'PHOTO',
-        like: s.followers || 0,
-        comment: s.posts || 0,
-        share: 0
-      }
-    ])
-      .addTable(statsTable)
-    builder.addSuggest([
-      'Buka Profil Instagram',
-      'Download Foto Profil',
-    ])
-
-    await builder.send(m.chat, { quoted: m.raw })
-    await m.react('✅')
-
-  } catch (err) {
-    console.error('[IGSTALK]', err)
-    await m.react('❌')
-    await m.reply(beautifulMessage(`❌ Gagal mengambil data: ${err.message.slice(0, 100)}`, { pushName: m.pushName }))
-  }
 }

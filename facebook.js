@@ -1,111 +1,104 @@
-// plugins/downloader/facebook.js
-import { facebookDownloader } from '../../src/scrape/facebook.js';
-import { beautifulMessage } from '../../src/lib/text-formater.js';
-import { AIRich } from '../../src/lib/_build-m.js';
+// src/scrape/facebook.js
+import axios from "axios";
+import forge from "node-forge";
+import crypto from "node:crypto";
 
-export const config_ = {
-  name: 'facebook',
-  alias: ['fbdl', 'fb', 'facebookdl'],
-  category: 'downloader',
-  description: 'Download video/foto dari Facebook (AI Rich)',
-  usage: '.facebook <url>',
-  example: '.facebook https://www.facebook.com/share/v/xxxxx',
-  isOwner: false,
-  isPremium: false,
-  isGroup: false,
-  isPrivate: false,
-  cooldown: 10,
-  isEnabled: true,
-};
-export { config_ as config };
+const API = "https://api.hitube.io";
+const WEB = "https://www.hitube.io";
+const PUBLIC_KEY =
+  "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDCAdf/EyIbLBxjGqmh7qLU6/CPCzru+75+82OSPZ+nf4BFvg88drpZ6KigNW0J8TNgxe6Yms1irCZNVDyu+RXsl4y/7c2KOHc4OGTzHB5fUMiMasFUvcEs2P70e6yA/sKHZfBLG1XPhlb84Ibs3nhD3W5e2SuC+4EuVkaqzN08LQIDAQAB";
 
-export async function handler(m, { sock }) {
-  let url = m.args[0];
+const UA =
+  "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Mobile Safari/537.36";
 
-  if (!url && m.quoted?.body) {
-    const quotedText = m.quoted.body;
-    const urlMatch = quotedText.match(/(https?:\/\/(?:www\.|web\.|m\.)?facebook\.com\/[^\s]+)/);
-    if (urlMatch) url = urlMatch[1];
-  }
+function createSessionId() {
+  const random = crypto.randomBytes(6).toString("base64url").slice(0, 10);
+  return `hitube.io_${random}_${Date.now()}`;
+}
 
-  if (!url) {
-    return m.reply(beautifulMessage(
-      '❌ Masukkan URL Facebook.\nContoh: .facebook https://www.facebook.com/share/v/xxxxx',
-      { pushName: m.pushName }
-    ));
-  }
+function createSecureMessage() {
+  const pem = `-----BEGIN PUBLIC KEY-----\n${PUBLIC_KEY.match(/.{1,64}/g).join("\n")}\n-----END PUBLIC KEY-----`;
+  const publicKey = forge.pki.publicKeyFromPem(pem);
+  const encrypted = publicKey.encrypt(Date.now().toString(), "RSAES-PKCS1-V1_5");
+  return forge.util.encode64(encrypted);
+}
 
-  if (!/https?:\/\/(www\.|web\.|m\.)?facebook\.com\//i.test(url)) {
-    return m.reply(beautifulMessage('❌ URL harus dari Facebook (facebook.com)', { pushName: m.pushName }));
-  }
+function mediaUrl(token, sessionid) {
+  return `${API}/st-tik-video/token/${encodeURIComponent(token)}?sessionid=${encodeURIComponent(sessionid)}&wh=www.hitube.io`;
+}
 
-  await m.react('⏳');
+function mapMedia(item, sessionid) {
+  const data = {
+    type: item.type || "file",
+    url: item.url ? mediaUrl(item.url, sessionid) : null
+  };
+
+  if (item.tag) data.quality = item.tag;
+  if (item.size) data.size = item.size;
+  if (item.cover) data.cover = mediaUrl(item.cover, sessionid);
+  if (item.thumb) data.thumbnail = mediaUrl(item.thumb, sessionid);
+
+  return data;
+}
+
+/**
+ * Download Facebook video/photo menggunakan hitube.io
+ * @param {string} url - URL Facebook (post/reel/video)
+ * @returns {Promise<{status: boolean, code: number, title?: string, username?: string, media: Array<{type: string, url: string, quality?: string, size?: string}>}>}
+ */
+export async function facebookDownloader(url) {
+  const sessionid = createSessionId();
 
   try {
-    const result = await facebookDownloader(url);
-
-    if (!result.status || !result.media || result.media.length === 0) {
-      return m.reply(beautifulMessage('❌ Media tidak ditemukan.', { pushName: m.pushName }));
-    }
-
-    const builder = new AIRich(sock)
-      .setTitle('📘 Facebook Downloader')
-      .addText(`## ${result.title || 'Facebook Post'}\n` +
-        (result.username ? `👤 **Username:** ${result.username}\n` : '') +
-        `📁 **Total Media:** ${result.media.length}`
-      );
-
-    // Pisahkan video dan gambar
-    const videos = result.media.filter(m => m.type === 'video' || m.type === 'file');
-    const images = result.media.filter(m => m.type === 'image' || m.type === 'photo');
-
-    // Kirim video pertama (jika ada)
-    if (videos.length > 0) {
-      const video = videos[0];
-      if (video.url) {
-        builder.addVideo(video.url, {
-          thumbnail: video.thumbnail || video.cover || '',
-          duration: 0,
-          file_length: video.size || 0,
-          mime_type: 'video/mp4'
-        });
+    const res = await axios.get(`${API}/st-tik-video/fb/dl`, {
+      timeout: 60000,
+      validateStatus: () => true,
+      params: {
+        url,
+        sessionid
+      },
+      headers: {
+        "x-secure-message": createSecureMessage(),
+        accept: "application/json, text/plain, */*",
+        origin: WEB,
+        referer: `${WEB}/`,
+        "user-agent": UA
       }
+    });
+
+    const data = res.data;
+
+    if (res.status !== 200 || data?.code !== 200) {
+      return {
+        status: false,
+        code: data?.code || res.status,
+        media: []
+      };
     }
 
-    // Kirim gambar
-    if (images.length === 1) {
-      builder.addImage(images[0].url, { resolveUrl: false });
-    } else if (images.length > 1) {
-      const reelItems = images.map((img, i) => ({
-        username: result.username || 'Facebook',
-        profile: 'https://via.placeholder.com/150',
-        thumbnail: img.url,
-        url: img.url,
-        title: `Gambar ${i + 1}`,
-        source: 'FB',
-        verified: false
-      }));
-      builder.addReels(reelItems);
-    }
+    const list = Array.isArray(data?.result?.fbBos) ? data.result.fbBos : [];
+    const media = list
+      .map(item => mapMedia(item, sessionid))
+      .filter(item => item.url);
 
-    // Tambahkan tabel statistik (opsional)
-    if (result.media.length > 0) {
-      const rows = [
-        ['Tipe', 'Jumlah'],
-        ['Video', String(videos.length)],
-        ['Gambar', String(images.length)]
-      ];
-      builder.addTable(rows);
-    }
+    // Ambil judul/username jika ada
+    const title = data?.result?.title || data?.result?.description || '';
+    const username = data?.result?.author || '';
 
-    builder.addSuggest(['Download Lagi', 'Cari Facebook Lain']);
-
-    await builder.send(m.chat, { quoted: m.raw });
-    await m.react('✅');
-
-  } catch (err) {
-    console.error('[FACEBOOK]', err);
-    await m.react('❌');
-    await m.reply(beautifulMessage(`❌ Error: ${err.message}`, { pushName: m.pushName }));
+    return {
+      status: media.length > 0,
+      code: data.code,
+      title,
+      username,
+      media
+    };
+  } catch (e) {
+    return {
+      status: false,
+      code: e.response?.status || 500,
+      media: []
+    };
   }
 }
+
+export default facebookDownloader;

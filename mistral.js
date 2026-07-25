@@ -1,54 +1,226 @@
-// plugins/ai/mistral.js
-import { mistral } from '../../src/scrape/mistral.js'
-import { parseAIResponse } from '../../src/ai/ai-response-parser.js'
-import { AIRich } from '../../src/lib/_build-m.js'
-import config from '../../config.js'
+// src/scrape/mistral.js
+import axios from 'axios';
+import crypto from 'crypto';
 
-const memory = new Map()
+const CONFIG = {
+    BASE_URL: 'https://chat.mistral.ai',
+    HEADERS: {
+        'User-Agent': 'le-chat-mobile/2.7.0 (build:20700421; os_name:ios; device_category:smartphone; device_model:iPhone 17 Pro; device_manufacturer:Apple)',
+        'Accept-Language': 'en-US',
+        'Accept': '*/*',
+        'Content-Type': 'application/json'
+    }
+};
 
-export const config_ = {
-  name: 'mistral',
-  alias: ['mistralai', 'mistralchat'],
-  category: 'ai',
-  description: 'AI Chat dengan Mistral AI (scraper)',
-  usage: '.mistral <pertanyaan> | .mistral clear',
-  example: '.mistral apa itu black hole?',
-  isOwner: false,
-  cooldown: 8,
-  isEnabled: true,
-}
-export { config_ as config }
+const Helpers = {
+    uid: () => crypto.randomUUID(),
 
-export async function handler(m, { sock }) {
-  const input = m.text?.trim() || ''
-  if (!input) return m.reply('❌ Masukkan pertanyaan. Contoh: *.mistral apa itu AI?*')
+    jar: (headers) => {
+        if (!headers || !headers['set-cookie']) return {};
+        const cookies = Array.isArray(headers['set-cookie'])
+            ? headers['set-cookie']
+            : [headers['set-cookie']];
+        return Object.fromEntries(
+            cookies.map(c => {
+                const a = c.indexOf('=');
+                return a < 0 ? [] : [c.slice(0, a).trim(), c.slice(a + 1).split(';')[0].trim()];
+            }).filter(e => e.length)
+        );
+    },
 
-  if (input.toLowerCase() === 'clear') {
-    memory.delete(m.sender)
-    return m.reply('🧹 Memori percakapan dihapus.')
-  }
+    jarStr: (jar) => Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; '),
 
-  let userData = memory.get(m.sender) || {}
-  let session = userData.session || null
-  let room = userData.room || null
+    getToken: (buffer) => {
+        const idx = buffer.indexOf('\n');
+        if (idx === -1) return { token: '', rest: buffer };
+        return { token: buffer.slice(0, idx), rest: buffer.slice(idx + 1) };
+    },
 
-  try {
-    const result = await mistral.send(input, session, room)
-    memory.set(m.sender, { session: result.session, room: result.room })
+    peel: (raw) => {
+        const sep = raw.indexOf(':');
+        if (sep < 1 || isNaN(parseInt(raw[0]))) return null;
+        try { return JSON.parse(raw.slice(sep + 1)); } catch { return null; }
+    },
 
-    const raw = result.response
-    const parsed = parseAIResponse(raw)
-    const builder = new AIRich(sock).setTitle('🧠 Mistral AI')
-    if (parsed.title) builder.setTitle(parsed.title)
-    for (const t of parsed.texts) builder.addText(t)
-    for (const c of parsed.codes) builder.addCode(c.lang, c.code)
-    for (const t of parsed.tables) builder.addTable(t)
-    if (parsed.suggests.length) builder.addSuggest(parsed.suggests)
-    await builder.send(m.chat, { quoted: m.raw })
-    m.react('✅')
-  } catch (err) {
-    console.error('[MISTRAL]', err)
-    m.react('❌')
-    await m.reply(`❌ Gagal: ${err.message}`)
-  }
-}
+    extract: (patch) => {
+        if (patch.op === 'append' && patch.path && patch.path.includes('/text')) {
+            return patch.value;
+        }
+        if (patch.op === 'replace' && patch.path === '/contentChunks') {
+            if (Array.isArray(patch.value) && patch.value[0]?.text) {
+                return patch.value[0].text;
+            }
+        }
+        return '';
+    },
+
+    dateCtx: () => {
+        return new Date().toLocaleDateString('en-US', {
+            weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
+        });
+    }
+};
+
+export const mistral = {
+    _send: async (endpoint, data, cookie = '') => {
+        const headers = { ...CONFIG.HEADERS };
+        if (cookie) headers.Cookie = cookie;
+        const res = await axios.post(`${CONFIG.BASE_URL}${endpoint}`, data, { 
+            headers,
+            timeout: 30000
+        });
+        return { data: res.data, cookies: Helpers.jar(res.headers) };
+    },
+
+    _handshake: async () => {
+        const { cookies } = await mistral._send(
+            '/api/trpc/event.sendEventToDatalake,event.sendEventToDatalake?batch=1',
+            {
+                "0": { "json": { "name": "app_downloaded", "properties": {} } },
+                "1": {
+                    "json": {
+                        "name": "app_started",
+                        "properties": {
+                            "os": "iOS", "osVersion": "18.3.2",
+                            "deviceManufacturer": "Apple",
+                            "screenWidth": 430, "screenHeight": 932,
+                            "windowWidth": 430, "windowHeight": 932,
+                            "pixelRatio": 3, "fontScale": 1,
+                            "deviceColorScheme": "dark",
+                            "preferredLocale": "en-US",
+                            "permissions": {
+                                "notifications": "undetermined",
+                                "camera": "undetermined",
+                                "mediaLibrary": "denied"
+                            }
+                        }
+                    }
+                }
+            }
+        );
+
+        const cookie = Helpers.jarStr(cookies);
+
+        await mistral._send('/api/trpc/user.acceptToS?batch=1', { "0": { "json": {} } }, cookie);
+
+        return { cookie, identifier: Helpers.uid() };
+    },
+
+    _createRoom: async (text, session) => {
+        const { data } = await axios.post(
+            `${CONFIG.BASE_URL}/api/trpc/message.newChat?batch=1`,
+            {
+                "0": {
+                    "json": {
+                        "files": [],
+                        "content": [{ "type": "text", "text": text }],
+                        "transcriptionsMetadata": null, "agentId": null,
+                        "agentsApiAgentId": null, "features": ["beta-websearch"],
+                        "integrations": [], "libraries": [],
+                        "productType": "chat", "projectId": null,
+                        "incognito": null, "chatId": null,
+                        "parentId": null, "parentVersion": null
+                    },
+                    "meta": {
+                        "values": {
+                            "transcriptionsMetadata": ["undefined"],
+                            "agentId": ["undefined"],
+                            "agentsApiAgentId": ["undefined"],
+                            "projectId": ["undefined"],
+                            "incognito": ["undefined"],
+                            "chatId": ["undefined"],
+                            "parentId": ["undefined"],
+                            "parentVersion": ["undefined"]
+                        },
+                        "v": 1
+                    }
+                }
+            },
+            { 
+                headers: { ...CONFIG.HEADERS, Cookie: session.cookie },
+                timeout: 30000
+            }
+        );
+
+        return data[0].result.data.json.chatId;
+    },
+
+    _compose: (message, roomId, session, fresh) => ({
+        chatId: roomId,
+        stableAnonymousIdentifier: session.identifier,
+        platform: "mobile",
+        clientPromptData: {
+            currentDate: Helpers.dateCtx(),
+            userTimezone: "T+07:00 (Asia/Jakarta)"
+        },
+        shouldAwaitStreamBackgroundTasks: true,
+        shouldUseMessagePatch: true,
+        supportedTaskCallbacks: [
+            "ask_user_question", "ask_user_confirmation",
+            "collect_workflow_input", "delegate_workflow_execution",
+            "enable_connector"
+        ],
+        features: ["beta-websearch"],
+        integrations: [],
+        libraries: [],
+        mode: fresh ? "start" : "append",
+        messageId: fresh ? undefined : Helpers.uid(),
+        messageInput: fresh ? undefined : [{ "type": "text", "text": message }],
+        disabledFeatures: fresh ? ["memory-inference"] : undefined,
+        messageFiles: fresh ? undefined : []
+    }),
+
+    _stream: async function* (payload, session) {
+        const res = await axios.post(`${CONFIG.BASE_URL}/api/chat`, payload, {
+            headers: { ...CONFIG.HEADERS, Cookie: session.cookie, Accept: 'text/event-stream' },
+            responseType: 'stream',
+            timeout: 60000
+        });
+
+        let buf = '';
+
+        for await (const chunk of res.data) {
+            buf += chunk.toString();
+            while (buf.includes('\n')) {
+                const { token, rest } = Helpers.getToken(buf);
+                buf = rest;
+                if (!token.trim()) continue;
+
+                const ev = Helpers.peel(token);
+                if (!ev || !ev.json?.patches) continue;
+
+                for (const p of ev.json.patches) {
+                    const v = Helpers.extract(p);
+                    if (v) yield v;
+                }
+            }
+        }
+    },
+
+    createSession: async () => {
+        const session = await mistral._handshake();
+        return session;
+    },
+
+    send: async (message, session = null, roomId = null) => {
+        const fresh = !session || !roomId;
+
+        if (!session) session = await mistral.createSession();
+        if (!roomId) {
+            roomId = await mistral._createRoom(message, session);
+        }
+
+        const payload = mistral._compose(message, roomId, session, fresh);
+        let output = '';
+
+        for await (const token of mistral._stream(payload, session)) {
+            output += token;
+        }
+
+        return {
+            response: output.trim(),
+            room: roomId,
+            session
+        };
+    }
+};

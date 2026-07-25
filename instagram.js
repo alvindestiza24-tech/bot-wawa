@@ -1,105 +1,174 @@
-// plugins/downloader/instagram.js
-import instagramDownloader from '../../src/scrape/instagram.js';
-import { beautifulMessage } from '../../src/lib/text-formater.js';
-import { AIRich } from '../../src/lib/_build-m.js';
+// src/scrape/instagram.js
+import axios from "axios";
+import crypto from "crypto";
 
-export const config_ = {
-  name: 'instagram',
-  alias: ['igdl', 'insta', 'ig'],
-  category: 'downloader',
-  description: 'Download video/foto dari Instagram (AI Rich)',
-  usage: '.instagram <url>',
-  example: '.instagram https://www.instagram.com/p/xxxxx',
-  isOwner: false,
-  isPremium: false,
-  isGroup: false,
-  isPrivate: false,
-  cooldown: 10,
-  isEnabled: true,
+const CONFIG = {
+  secretKeyHex:
+    "34ac9a1aa6aaa7d69a7075611898f16a85d496b1d8f1c7aaa5640a2d93d7af80",
+  appVersionTS: "1770240123231",
+  userAgent:
+    "Mozilla/5.0 (Linux; Android 10; RMX2185 Build/QP1A.190711.020) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.7559.109 Mobile Safari/537.36",
 };
-export { config_ as config };
 
-export async function handler(m, { sock }) {
-  let url = m.args[0];
+const CORS_PROXY = "https://cors.yardansh.com/";
 
-  if (!url && m.quoted?.body) {
-    const quotedText = m.quoted.body;
-    const urlMatch = quotedText.match(/(https?:\/\/www\.instagram\.com\/[^\s]+)/);
-    if (urlMatch) url = urlMatch[1];
+async function fastDLDownload(igUrl) {
+  const isStory = igUrl.includes("/stories/");
+  let cleanUrl = igUrl.split("?")[0];
+  if (!cleanUrl.endsWith("/")) cleanUrl += "/";
+
+  const homeRes = await axios.get(CORS_PROXY + "https://fastdl.app/id", {
+    headers: { "User-Agent": CONFIG.userAgent },
+  });
+  const cookieStr = homeRes.headers["set-cookie"]
+    ? homeRes.headers["set-cookie"].map((c) => c.split(";")[0]).join("; ")
+    : "";
+
+  const msecRes = await axios.get(CORS_PROXY + "https://fastdl.app/msec", {
+    headers: { "User-Agent": CONFIG.userAgent, Cookie: cookieStr },
+  });
+  const serverTime = Math.floor(msecRes.data.msec * 1000);
+  const ts = serverTime - 450;
+
+  const signatureSource = isStory
+    ? JSON.stringify({ url: cleanUrl }) + ts
+    : cleanUrl + ts;
+  const signature = crypto
+    .createHmac("sha256", Buffer.from(CONFIG.secretKeyHex, "hex"))
+    .update(signatureSource)
+    .digest("hex");
+
+  let response;
+  if (isStory) {
+    response = await axios.post(
+      CORS_PROXY + "https://api-wh.fastdl.app/api/v1/instagram/story",
+      {
+        url: cleanUrl,
+        ts,
+        _ts: CONFIG.appVersionTS,
+        _tsc: 0,
+        _sv: 2,
+        _s: signature,
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          "User-Agent": CONFIG.userAgent,
+          Origin: "https://fastdl.app",
+          Referer: "https://fastdl.app/id/story-saver",
+          Cookie: cookieStr,
+        },
+      },
+    );
+  } else {
+    const params = new URLSearchParams();
+    params.append("sf_url", cleanUrl);
+    params.append("ts", ts);
+    params.append("_ts", CONFIG.appVersionTS);
+    params.append("_tsc", "0");
+    params.append("_sv", "2");
+    params.append("_s", signature);
+
+    response = await axios.post(
+      CORS_PROXY + "https://api-wh.fastdl.app/api/convert",
+      params.toString(),
+      {
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+          "User-Agent": CONFIG.userAgent,
+          Origin: "https://fastdl.app",
+          Referer: "https://fastdl.app/id",
+          Cookie: cookieStr,
+        },
+      },
+    );
   }
-
-  if (!url) return m.reply(beautifulMessage('❌ Masukkan URL Instagram. Contoh: .ig https://www.instagram.com/p/xxxxx', { pushName: m.pushName }));
-
-  if (!/https?:\/\/(www\.)?instagram\.com\//i.test(url)) {
-    return m.reply(beautifulMessage('❌ URL harus dari Instagram (instagram.com)', { pushName: m.pushName }));
-  }
-
-  await m.react('⏳');
-
-  try {
-    const result = await instagramDownloader(url);
-
-    if (!result || !result.media || result.media.length === 0) {
-      return m.reply(beautifulMessage('❌ Media tidak ditemukan.', { pushName: m.pushName }));
-    }
-
-    const isStory = url.includes('/stories/');
-    const typeLabel = isStory ? 'Story' : 'Post';
-
-    const builder = new AIRich(sock)
-      .setTitle('📸 Instagram Downloader')
-      .addText(`## ${typeLabel}\n👤 **Username:** ${result.username || '-'}\n` +
-        (result.likes ? `❤️ **Likes:** ${result.likes}\n` : '') +
-        (result.comment ? `💬 **Comments:** ${result.comment}\n` : '') +
-        (result.taken_at ? `📅 **Taken:** ${result.taken_at}\n` : '')
-      );
-
-    // Cari video dan gambar dengan deteksi yang lebih baik
-    const videos = result.media.filter(m => {
-      const type = (m.type || '').toLowerCase();
-      return type === 'video' || type === 'mp4' || type === 'reel' || 
-             (m.url && /\.(mp4|mov|webm)$/i.test(m.url));
-    });
-
-    const images = result.media.filter(m => {
-      const type = (m.type || '').toLowerCase();
-      return type === 'image' || type === 'photo' || type === 'jpg' || type === 'png' ||
-             (m.url && !videos.includes(m) && /\.(jpg|jpeg|png|webp)$/i.test(m.url));
-    });
-
-    // Kirim video jika ada
-    if (videos.length > 0) {
-      const videoUrl = videos[0].url || videos[0];
-      if (videoUrl) {
-        builder.addVideo(videoUrl);
-      }
-    }
-
-    // Kirim gambar
-    if (images.length === 1) {
-      builder.addImage(images[0].url || images[0], { resolveUrl: false });
-    } else if (images.length > 1) {
-      const reelItems = images.map((img, i) => ({
-        username: result.username || 'Instagram',
-        profile: 'https://via.placeholder.com/150',
-        thumbnail: img.url || img,
-        url: img.url || img,
-        title: `Gambar ${i + 1}`,
-        source: 'IG',
-        verified: false
-      }));
-      builder.addReels(reelItems);
-    }
-
-    // Tambahkan saran
-    builder.addSuggest(['Download Lagi', 'Cari Instagram Lain']);
-
-    await builder.send(m.chat, { quoted: m.raw });
-    await m.react('✅');
-
-  } catch (err) {
-    console.error('[INSTAGRAM]', err);
-    await m.react('❌');
-    await m.reply(beautifulMessage(`❌ Error: ${err.message}`, { pushName: m.pushName }));
-  }
+  return response.data;
 }
+
+function formatStoryResult(data) {
+  const result = data.result[0];
+  const media = [];
+  if (result.video_versions?.length > 0)
+    media.push({
+      type: "video",
+      url: result.video_versions[0].url_wrapped || result.video_versions[0].url,
+    });
+  if (result.image_versions2?.candidates?.length > 0)
+    media.push({
+      type: "image",
+      url:
+        result.image_versions2.candidates[0].url_wrapped ||
+        result.image_versions2.candidates[0].url,
+    });
+  return {
+    username: result.user?.username || "-",
+    id: result.user?.id || "-",
+    is_private: result.user?.is_private || false,
+    profile_url: result.user?.profile_pic_url || "-",
+    taken_at: result.taken_at || "-",
+    media,
+  };
+}
+
+function formatPostResult(data) {
+  const items = Array.isArray(data) ? data : [data];
+  const media = [];
+  const firstItem = items[0];
+  const meta = firstItem.meta || {};
+
+  for (const item of items) {
+    if (item.url && Array.isArray(item.url)) {
+      // Cari video terlebih dahulu
+      const videoUrl = item.url.find(u => u.type === 'video');
+      if (videoUrl) {
+        media.push({
+          type: 'video',
+          url: videoUrl.url || ''
+        });
+      } else {
+        // Ambil gambar pertama
+        const imageUrl = item.url[0];
+        media.push({
+          type: imageUrl.type || 'image',
+          url: imageUrl.url || ''
+        });
+      }
+    } else if (item.hd) {
+      media.push({
+        type: 'video',
+        url: item.hd
+      });
+    } else if (item.sd) {
+      media.push({
+        type: 'video',
+        url: item.sd
+      });
+    } else if (item.thumb) {
+      media.push({
+        type: 'image',
+        url: item.thumb
+      });
+    }
+  }
+
+  return {
+    title: meta.title || "-",
+    likes: meta.like_count || "-",
+    comment: meta.comment_count || "-",
+    username: meta.username || "-",
+    taken_at: meta.taken_at || "-",
+    thumbnail: firstItem.thumb || "-",
+    media,
+    comments: meta.comments || [],
+  };
+}
+
+export async function instagramDownloader(url) {
+  const data = await fastDLDownload(url);
+  return url.includes("/stories/")
+    ? formatStoryResult(data)
+    : formatPostResult(data);
+}
+
+export default instagramDownloader;
