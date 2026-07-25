@@ -1,16 +1,15 @@
-import { readFile, unlink } from 'node:fs/promises'
-import { join } from 'node:path'
-import { writeFile } from 'node:fs/promises'
-import { generateNews } from '../../src/canvas/kompas.js'
-import { downloadContentFromMessage } from '@kyyinfinite/baileys'
+// plugins/search/kompas.js
+import { scrapeKompas, searchKompas } from '../../src/scrape/kompas.js'
+import { AIRich } from '../../src/lib/_build-m.js'
+import { beautifulMessage } from '../../src/lib/text-formater.js'
 
 export const config_ = {
-  name: 'news',
-  alias: ['berita', 'newsmaker'],
-  category: 'maker',
-  description: 'Buat gambar berita dengan teks dan foto (reply gambar atau langsung)',
-  usage: '.news <teks> (reply gambar)',
-  example: '.news Halo dunia',
+  name: 'kompas',
+  alias: ['berita', 'news', 'kompascom'],
+  category: 'search',
+  description: 'Cari berita terkini dari Kompas.com',
+  usage: '.kompas [query]',
+  example: '.kompas\n.kompas politik',
   isOwner: false,
   isPremium: false,
   isGroup: false,
@@ -21,56 +20,65 @@ export const config_ = {
 export { config_ as config }
 
 export async function handler(m, { sock }) {
-  let text = m.args.join(' ').trim()
-  if (!text && m.quoted?.body) text = m.quoted.body
-  if (!text) return m.reply('❌ Masukkan teks berita. Contoh: .news Halo dunia')
-
-  // Cek apakah ada gambar yang di-reply atau dikirim langsung dengan caption
-  let photoSrc = null
-  let mediaTarget = null
-
-  if (m.quoted?.type === 'imageMessage') {
-    mediaTarget = m.quoted
-  } else if (m.type === 'imageMessage' && m.quoted) {
-    mediaTarget = m
-  } else if (m.type === 'imageMessage' && !m.quoted) {
-    mediaTarget = m
-  }
-
-  if (mediaTarget) {
-    try {
-      const messageType = mediaTarget.type.replace('Message', '')
-      const stream = await downloadContentFromMessage(mediaTarget.message[messageType], messageType)
-      let buffer = Buffer.from([])
-      for await (const chunk of stream) {
-        buffer = Buffer.concat([buffer, chunk])
-      }
-      if (buffer && buffer.length > 0) {
-        const tempPath = join(process.cwd(), 'storage', '.tmp', `newsphoto-${Date.now()}.jpg`)
-        await writeFile(tempPath, buffer)
-        photoSrc = tempPath
-      }
-    } catch (err) {
-      console.error('[NEWS] Gagal download foto:', err.message)
-    }
-  }
+  const query = m.text?.trim() || null
 
   await m.react('⏳')
 
   try {
-    const outputPath = await generateNews(text, photoSrc)
-    const buffer = await readFile(outputPath)
-    await sock.sendMessage(m.chat, {
-      image: buffer,
-      caption: `📰 *${text}*`,
-      mimetype: 'image/png',
-    }, { quoted: m.raw })
-    await unlink(outputPath).catch(() => {})
-    if (photoSrc) await unlink(photoSrc).catch(() => {})
+    const result = query ? await searchKompas(query, 5) : await scrapeKompas(null, 5)
+
+    if (!result.success || result.articles.length === 0) {
+      await m.react('😔')
+      return m.reply(
+        beautifulMessage(
+          query
+            ? `❌ Berita dengan kata *"${query}"* tidak ditemukan.`
+            : '❌ Tidak ada berita terkini yang ditemukan.',
+          { pushName: m.pushName }
+        )
+      )
+    }
+
+    const title = query ? `🔍 Hasil Pencarian: "${query}"` : '📰 Berita Terkini'
+
+    const builder = new AIRich(sock)
+      .setTitle('📰 Kompas.com')
+      .addText(`## ${title}\nDitemukan ${result.total} berita`)
+
+    // Tambahkan produk (kartu dengan gambar + judul + link)
+    const products = result.articles.map((article) => ({
+      title: article.title,
+      brand: article.author || 'Kompas.com',
+      price: article.time || 'Baru',
+      image_url: article.thumbnail || '',
+      product_url: article.url,
+      sale_price: article.source || 'Kompas',
+    }))
+    builder.addProduct(products)
+
+    // Tambahkan daftar berita dengan hyperlink (hanya title yang di-link)
+    const listText = result.articles
+      .map(
+        (a, i) =>
+          `${i + 1}. [${a.title}](${a.url})\n` +
+          `   📅 ${a.time || 'Baru'} ${a.author ? `• ${a.author}` : ''}`
+      )
+      .join('\n\n')
+
+    builder.addText(`## 📋 Daftar Berita\n${listText}`)
+
+    // Saran pencarian
+    const suggests = query
+      ? ['kompas', 'kompas politik', 'kompas ekonomi']
+      : ['kompas', 'kompas politik', 'kompas hari ini']
+
+    builder.addSuggest(suggests)
+
+    await builder.send(m.chat, { quoted: m.raw })
     await m.react('✅')
   } catch (err) {
-    console.error('[NEWS]', err)
+    console.error('[KOMPAS]', err)
     await m.react('❌')
-    await m.reply(`❌ Gagal membuat gambar: ${err.message}`)
+    await m.reply(beautifulMessage(`❌ Gagal mengambil berita: ${err.message}`, { pushName: m.pushName }))
   }
 }
